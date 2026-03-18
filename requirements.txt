@@ -1,0 +1,3 @@
+# Emulator automation for markt.de login (Appium + Chrome on Android emulator)
+Appium-Python-Client>=3.0.0
+selenium>=4.15.0
