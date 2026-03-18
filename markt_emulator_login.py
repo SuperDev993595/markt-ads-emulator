@@ -234,6 +234,11 @@ def run_login(account: dict, connect_adb: bool = True, udid: str | None = None) 
 if __name__ == "__main__":
     # Example: run with one account from command line or env
     import os as _os
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent / ".env")
+    except ImportError:
+        pass
     _email = _os.environ.get("MARKT_EMAIL", "").strip()  # noqa: PLC0415
     _password = _os.environ.get("MARKT_PASSWORD", "").strip()
     if not _email or not _password:
