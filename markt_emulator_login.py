@@ -5,7 +5,7 @@ but runs in the emulator's Chrome.
 
 Requirements:
   - Emulator running (LDPlayer or BlueStacks) with ADB enabled
-  - Appium server running (e.g. appium)
+  - Appium server running — on Windows use start-appium.cmd (sets ANDROID_HOME for Appium)
   - Chrome installed in the emulator
   - config.py adjusted for your emulator port
 """
@@ -22,10 +22,19 @@ from appium import webdriver
 from appium.options.android import UiAutomator2Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
 import config
+from markt_cookie_consent import click_accept_all_cookies_selenium
+
+MARKT_MEINE_ANZEIGEN_URL = "https://www.markt.de/benutzer/meineanzeigen.htm"
+MARKT_INSERIEREN_URL = "https://www.markt.de/benutzer/inserieren.htm"
+
+# Shown on Meine Anzeigen when the profile cannot publish (all parts should appear in page HTML).
+MEINE_ANZEIGEN_CANNOT_POST_SNIPPETS: tuple[str, ...] = (
+    "Dein Profil ist derzeit eingeschränkt",
+    "Du kannst keine Anzeigen veröffentlichen",
+    "Alle aktiven Anzeigen wurden pausiert",
+)
 
 
 def log(email: str, message: str, level: str = "info") -> None:
@@ -54,6 +63,15 @@ def ensure_adb_connected() -> bool:
             log("system", "No emulator connected. Run: adb connect " + config.EMULATOR_ADB_HOST + ":" + str(config.EMULATOR_ADB_PORT), "error")
             return False
         log("system", f"ADB devices: {devices}", "debug")
+        if len(devices) > 1:
+            udid = getattr(config, "APPIUM_UDID", None)
+            log(
+                "system",
+                "Multiple ADB devices — Chromedriver often fails with 'chrome not reachable' "
+                f"if APPIUM_UDID is wrong. Current APPIUM_UDID={udid!r}. "
+                "Disconnect extras or set APPIUM_UDID to the device where Chrome runs.",
+                "warning",
+            )
         return True
     except FileNotFoundError:
         log("system", "adb not found. Install Android SDK platform-tools or set config.ADB_PATH.", "error")
@@ -63,43 +81,87 @@ def ensure_adb_connected() -> bool:
         return False
 
 
-def create_driver(udid: Optional[str] = None):
+def launch_chrome_via_adb(udid: str) -> bool:
+    """Start Chrome on the device via ADB (same as tapping the icon). Uses default profile so one-time setup is reused."""
+    adb = config.ADB_PATH or "adb"
+    pkg = getattr(config, "CHROME_ANDROID_PACKAGE", "com.android.chrome")
+    activity = "com.google.android.apps.chrome.Main"
+    try:
+        r = subprocess.run(
+            [adb, "-s", udid, "shell", "am", "start", "-n", f"{pkg}/{activity}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            log("system", f"ADB launch Chrome failed: {r.stderr or r.stdout}", "warning")
+            return False
+        log("system", "Launched Chrome via ADB (default profile).", "debug")
+        return True
+    except Exception as e:
+        log("system", f"ADB launch Chrome error: {e}", "warning")
+        return False
+
+
+def create_driver(udid: Optional[str] = None, use_running_chrome: Optional[bool] = None):
     """Create Appium WebDriver for Chrome on Android emulator."""
+    cache = Path(config.CHROMEDRIVER_EXECUTABLE_DIR).resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    effective_udid = udid or getattr(config, "APPIUM_UDID", None) or None
+    pkg = getattr(config, "CHROME_ANDROID_PACKAGE", "com.android.chrome")
+    use_running = use_running_chrome if use_running_chrome is not None else getattr(config, "CHROME_USE_RUNNING_APP", False)
+    extra_args = list(getattr(config, "CHROME_EXTRA_ARGS", None) or [])
+    chrome_opts: dict = {"androidPackage": pkg}
+    if use_running:
+        chrome_opts["androidUseRunningApp"] = True
+    if extra_args and not use_running:
+        chrome_opts["args"] = extra_args
+
+    pinned = getattr(config, "CHROMEDRIVER_EXECUTABLE", None)
+    use_autodownload = True
+    if pinned:
+        p = Path(pinned)
+        if p.is_file():
+            use_autodownload = False
+        else:
+            log("system", f"CHROMEDRIVER_EXECUTABLE not found ({p}), using autodownload.", "warning")
+
     caps = {
         "platformName": "Android",
         "automationName": "UiAutomator2",
         "browserName": "Chrome",
         "deviceName": "Android",
-        # Optional: force a specific emulator if multiple devices
-        # "udid": "emulator-5554",
+        # Prevent Appium from running "pm clear com.android.chrome" so Chrome profile (and "first run done") is kept.
+        "appium:noReset": True,
+        "appium:chromedriverAutodownload": use_autodownload,
+        "appium:chromedriverExecutableDir": str(cache),
+        "appium:chromedriverDisableBuildCheck": True,
+        "appium:chromedriverLaunchTimeout": 120000,
+        "goog:chromeOptions": chrome_opts,
     }
-    if udid:
-        caps["udid"] = udid
+    if not use_autodownload and pinned:
+        caps["appium:chromedriverExecutable"] = str(Path(pinned).resolve())
+    if effective_udid:
+        caps["udid"] = effective_udid
+        caps["appium:udid"] = effective_udid
     options = UiAutomator2Options().load_capabilities(caps)
-    driver = webdriver.Remote(config.APPIUM_SERVER_URL, options=options)
-    driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
-    driver.implicitly_wait(config.IMPLICIT_WAIT)
-    return driver
-
-
-def _click_accept_all_cookies(driver, email: str) -> None:
-    """Click cookie consent (e.g. 'Alle akzeptieren') if present."""
-    selectors = [
-        (By.CSS_SELECTOR, "button[data-action='accept']"),
-        (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'alle akzeptieren')]"),
-        (By.XPATH, "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'alle akzeptieren')]"),
-        (By.CSS_SELECTOR, "[data-testid='accept-cookies'], .cookie-accept, #accept-cookies, .accept-cookies"),
-    ]
-    for by, selector in selectors:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 4):
         try:
-            el = WebDriverWait(driver, 5).until(EC.presence_of_element_located((by, selector)))
-            if el.is_displayed():
-                el.click()
-                log(email, "Clicked cookie consent.", "debug")
-                return
-        except Exception:
-            continue
-    log(email, "No cookie consent button found (may already be accepted).", "debug")
+            driver = webdriver.Remote(config.APPIUM_SERVER_URL, options=options)
+            driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
+            driver.implicitly_wait(config.IMPLICIT_WAIT)
+            return driver
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if "chrome not reachable" in msg and attempt < 3:
+                log("system", f"Chrome not reachable (attempt {attempt}/3), retrying…", "warning")
+                time.sleep(4)
+                continue
+            raise
+    assert last_err is not None
+    raise last_err
 
 
 def save_cookies(driver, email: str) -> None:
@@ -117,6 +179,53 @@ def save_cookies(driver, email: str) -> None:
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(cookies, f, indent=2, ensure_ascii=False)
     log(email, f"Saved cookies to {filepath}", "info")
+
+
+def navigate_to_meine_anzeigen(driver, email: str) -> tuple[bool, bool]:
+    """
+    Open the logged-in «Meine Anzeigen» page where users post and manage ads.
+    Call only after login is confirmed (session cookies apply).
+
+    Returns (navigation_ok, profile_restricted_cannot_post).
+    - (True, False): page loaded and no “cannot publish” restriction message.
+    - (False, True): restriction text present — account cannot post ads.
+    - (False, False): load/page read error.
+    """
+    try:
+        driver.get(MARKT_MEINE_ANZEIGEN_URL)
+        time.sleep(2)
+    except Exception as e:
+        log(email, f"Failed to open Meine Anzeigen: {e}", "error")
+        return False, False
+
+    try:
+        html = driver.page_source
+    except Exception as e:
+        log(email, f"Meine Anzeigen: could not read page: {e}", "error")
+        return False, False
+
+    if all(snippet in html for snippet in MEINE_ANZEIGEN_CANNOT_POST_SNIPPETS):
+        log(
+            email,
+            "Meine Anzeigen: profile restricted — cannot publish ads; active listings paused.",
+            "warning",
+        )
+        return False, True
+
+    log(email, f"Opened Meine Anzeigen: {MARKT_MEINE_ANZEIGEN_URL}", "info")
+    return True, False
+
+
+def navigate_to_inserieren(driver, email: str) -> bool:
+    """Open the logged-in ad creation page (Inserieren). Call after Meine Anzeigen shows no posting block."""
+    try:
+        driver.get(MARKT_INSERIEREN_URL)
+        time.sleep(2)
+        log(email, f"Opened Inserieren: {MARKT_INSERIEREN_URL}", "info")
+        return True
+    except Exception as e:
+        log(email, f"Failed to open Inserieren: {e}", "error")
+        return False
 
 
 def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
@@ -137,7 +246,7 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
         return False, True
 
     time.sleep(2)
-    _click_accept_all_cookies(driver, email)
+    #click_accept_all_cookies_selenium(driver, email, log)
     time.sleep(2)
 
     try:
@@ -202,7 +311,17 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
     except Exception as e:
         log(email, f"Block check error: {e}", "error")
 
+    nav_ok, meine_restricted = navigate_to_meine_anzeigen(driver, email)
+    if meine_restricted:
+        return False, True
+
+    inserieren_ok = navigate_to_inserieren(driver, email) if nav_ok else False
+
     save_cookies(driver, email)
+    if not nav_ok:
+        return False, False
+    if not inserieren_ok:
+        return False, False
     return True, False
 
 
@@ -216,6 +335,10 @@ def run_login(account: dict, connect_adb: bool = True, udid: str | None = None) 
 
     driver = None
     try:
+        effective_udid = udid or getattr(config, "APPIUM_UDID", None)
+        if getattr(config, "CHROME_USE_RUNNING_APP", False) and effective_udid:
+            launch_chrome_via_adb(effective_udid)
+            time.sleep(3)
         driver = create_driver(udid=udid)
         return markt_login_and_save(driver, account)
     except Exception as e:
@@ -224,11 +347,13 @@ def run_login(account: dict, connect_adb: bool = True, udid: str | None = None) 
         traceback.print_exc()
         return False, True
     finally:
-        if driver:
+        if driver and not getattr(config, "KEEP_BROWSER_OPEN", False):
             try:
                 driver.quit()
             except Exception:
                 pass
+        elif driver and getattr(config, "KEEP_BROWSER_OPEN", False):
+            log(account.get("email", "?"), "KEEP_BROWSER_OPEN=True: Chrome left open. Close it manually or run script again.", "info")
 
 
 if __name__ == "__main__":

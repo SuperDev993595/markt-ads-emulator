@@ -1,2 +1,5 @@
 .env
 cookies/
+chromedriver-cache/
+markt_user_init.py
+_pycache_/*
