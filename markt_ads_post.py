@@ -22,6 +22,8 @@ from appium import webdriver
 from appium.options.android import UiAutomator2Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 import config
 from markt_cookie_consent import click_accept_all_cookies_selenium, dismiss_cmp_if_blocking
@@ -29,7 +31,7 @@ from markt_cookie_consent import click_accept_all_cookies_selenium, dismiss_cmp_
 MARKT_MEINE_ANZEIGEN_URL = "https://www.markt.de/benutzer/meineanzeigen.htm"
 MARKT_INSERIEREN_URL = "https://www.markt.de/benutzer/inserieren.htm"
 
-# Account dict keys: "email", "password", optional "proxy_url" (full upstream URL for
+# Account dict keys: "email", "password", optional "proxy_url" or "proxy" (full upstream URL for
 # set_proxy.begin_proxy_session — device uses ADB global http_proxy, not Chrome flags).
 
 # Shown on Meine Anzeigen when the profile cannot publish (all parts should appear in page HTML).
@@ -38,6 +40,109 @@ MEINE_ANZEIGEN_CANNOT_POST_SNIPPETS: tuple[str, ...] = (
     "Du kannst keine Anzeigen veröffentlichen",
     "Alle aktiven Anzeigen wurden pausiert",
 )
+
+
+def ensure_chrome_webview_context(driver) -> None:
+    """
+    Appium + Android Chrome: after driver.get(), context may be NATIVE_APP. Web locators
+    (id/css) only work in the Chrome WEBVIEW — otherwise: invalid argument: invalid locator.
+    """
+    try:
+        contexts = driver.contexts
+    except Exception:
+        return
+    if not contexts:
+        return
+    webviews = [c for c in contexts if "WEBVIEW" in c or "CHROMIUM" in c.upper()]
+    if not webviews:
+        return
+    preferred = next((c for c in webviews if "chrome" in c.lower()), webviews[-1])
+    try:
+        cur = driver.current_context
+    except Exception:
+        cur = None
+    if cur != preferred:
+        try:
+            driver.switch_to.context(preferred)
+        except Exception:
+            pass
+
+
+def wait_inserieren_text_input(driver, wait: WebDriverWait, field_id: str):
+    """
+    Markt «Inserieren» fields: stable id is sometimes on a wrapper; the real control is an
+    inner input. By.ID alone can target a non-input (clear/send_keys then fail).
+    Avoid a single XPath union (`|`) — Chrome/Appium has returned `invalid locator` for it.
+    """
+    try:
+        return wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, f"input#{field_id}")))
+    except Exception:
+        return wait.until(
+            EC.element_to_be_clickable(
+                (By.XPATH, f"//*[@id='{field_id}']//input[not(@type='hidden')][1]")
+            )
+        )
+
+
+def _ensure_markt_legal_checkbox(driver, wait: WebDriverWait, email: str, cb_id: str) -> None:
+    """Tick a legal checkbox. Newsletter row often uses a styled/hidden input — label click or JS may be required."""
+
+    def _find_input(use_wait: bool):
+        if use_wait:
+            try:
+                return wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, f"input[type='checkbox']#{cb_id}"))
+                )
+            except Exception:
+                return wait.until(
+                    EC.presence_of_element_located(
+                        (By.XPATH, f"//*[@id='{cb_id}']//input[@type='checkbox']")
+                    )
+                )
+        try:
+            return driver.find_element(By.CSS_SELECTOR, f"input[type='checkbox']#{cb_id}")
+        except Exception:
+            return driver.find_element(By.XPATH, f"//*[@id='{cb_id}']//input[@type='checkbox']")
+
+    cb = _find_input(True)
+    if cb.is_selected():
+        return
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", cb)
+    time.sleep(0.12)
+    for lbl_locator in (
+        (By.CSS_SELECTOR, f"label[for='{cb_id}']"),
+        (By.XPATH, f"//input[@type='checkbox' and @id='{cb_id}']/ancestor::label[1]"),
+    ):
+        try:
+            lbl = driver.find_element(*lbl_locator)
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", lbl)
+            lbl.click()
+            break
+        except Exception:
+            continue
+    time.sleep(0.18)
+    cb = _find_input(False)
+    if cb.is_selected():
+        return
+    try:
+        cb.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", cb)
+    time.sleep(0.12)
+    cb = _find_input(False)
+    if cb.is_selected():
+        return
+    driver.execute_script(
+        """
+        var el = arguments[0];
+        el.checked = true;
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        """,
+        cb,
+    )
+    if not cb.is_selected():
+        log(email, f"Legal checkbox could not be toggled: {cb_id}", "warning")
 
 
 def log(email: str, message: str, level: str = "info") -> None:
@@ -219,6 +324,7 @@ def navigate_to_meine_anzeigen(driver, email: str) -> tuple[bool, bool]:
     """
     try:
         driver.get(MARKT_MEINE_ANZEIGEN_URL)
+        ensure_chrome_webview_context(driver)
         time.sleep(2)
     except Exception as e:
         log(email, f"Failed to open Meine Anzeigen: {e}", "error")
@@ -243,14 +349,112 @@ def navigate_to_meine_anzeigen(driver, email: str) -> tuple[bool, bool]:
 
 
 def navigate_to_inserieren(driver, email: str) -> bool:
-    """Open the logged-in ad creation page (Inserieren). Call after Meine Anzeigen shows no posting block."""
+    """Open the logged-in ad creation page (Inserieren) and pre-fill the form. Call after Meine Anzeigen shows no posting block."""
+    wait = WebDriverWait(driver, 30)
     try:
         driver.get(MARKT_INSERIEREN_URL)
-        time.sleep(2)
+        ensure_chrome_webview_context(driver)
         log(email, f"Opened Inserieren: {MARKT_INSERIEREN_URL}", "info")
+
+        subject_el = wait_inserieren_text_input(driver, wait, "markt_createAdvert_field_SUBJECT")
+        subject_el.clear()
+        subject_el.send_keys("Test Anzeigentitel Automatisierung")
+        time.sleep(0.5)
+
+        iframe = wait.until(
+            EC.presence_of_element_located(
+                (
+                    By.XPATH,
+                    "//iframe[contains(@class,'cke_wysiwyg_frame') and contains(@title,'markt_createAdvert_field_BODY')]",
+                )
+            )
+        )
+        driver.switch_to.frame(iframe)
+        try:
+            body = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+            body.click()
+            time.sleep(0.2)
+            driver.execute_script("arguments[0].innerHTML = '';", body)
+            body.send_keys(
+                "Dies ist ein Beschreibungstext für eine automatisierte Testanzeige auf markt.de. "
+                "Er erfüllt die Mindestlänge von 100 Zeichen für das Anzeigenformular und dient "
+                "ausschließlich zu Testzwecken."
+            )
+        finally:
+            driver.switch_to.default_content()
+
+        launcher = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button.clsy-pwa-create-categorypicker-launcher"))
+        )
+        launcher.click()
+        time.sleep(0.5)
+
+        try:
+            show_all_cats = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        "//*[self::button or self::a][contains(., 'Alle Kategorien anzeigen')]",
+                    )
+                )
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", show_all_cats)
+            show_all_cats.click()
+            log(email, "Category picker: clicked 'Alle Kategorien anzeigen'.", "info")
+            time.sleep(0.4)
+        except Exception:
+            pass
+
+        for cat_id in ("3000000000", "3012000000", "3012020000"):
+            cat_btn = wait.until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, f'button[data-create-categorypicker-categoryid="{cat_id}"]')
+                )
+            )
+            cat_btn.click()
+            time.sleep(0.5)
+
+        tags_el = wait_inserieren_text_input(driver, wait, "markt_createAdvert_field_TAGS")
+        log(email, "tags_el: " + str(tags_el), "info")
+        tags_el.clear()
+        tags_el.send_keys("escort, test")
+        time.sleep(0.2)
+
+        zip_el = wait_inserieren_text_input(driver, wait, "markt_createAdvert_field_ZIPCODE_AND_CITY")
+        zip_el.clear()
+        zip_el.send_keys("10115 Berlin")
+        time.sleep(0.2)
+
+        for cb_id in (
+            "markt_legal_newsletterCheckbox",
+            "markt_legal_termsCheckbox",
+            "markt_legal_privacyCheckbox",
+        ):
+            _ensure_markt_legal_checkbox(driver, wait, email, cb_id)
+
+        time.sleep(2)
+        submit = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button#clsy-create-secondaryfields-submit"))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", submit)
+        try:
+            submit.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", submit)
+        log(
+            email,
+            "Inserieren: form filled; clicked submit (Anzeige aufgeben / clsy-create-secondaryfields-submit).",
+            "info",
+        )
+
+        time.sleep(120)
         return True
     except Exception as e:
-        log(email, f"Failed to open Inserieren: {e}", "error")
+        log(email, f"Inserieren failed: {e}", "error")
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
         return False
 
 
@@ -267,6 +471,7 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
 
     try:
         driver.get(login_url)
+        ensure_chrome_webview_context(driver)
     except Exception as e:
         log(email, f"Page load error: {e}", "error")
         return False, True
@@ -355,20 +560,31 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
     return True, False
 
 
+def _upstream_proxy_url_from_account(account: dict) -> str | None:
+    """DB/task accounts use ``proxy``; CLI and tests often use ``proxy_url`` — both are accepted."""
+    raw = (account.get("proxy_url") or account.get("proxy") or "").strip()
+    return raw or None
+
+
 def post_ads(account: dict, connect_adb: bool = True, udid: str | None = None) -> tuple[bool, bool]:
     """
-    Full flow: optional ``set_proxy`` session from ``account[\"proxy_url\"]``, ensure ADB connected,
-    create driver, login, quit, then tear down the proxy session.
+    Full flow: optional ``set_proxy`` session from ``account[\"proxy_url\"]`` or ``account[\"proxy\"]``,
+    ensure ADB connected, create driver, login, quit, then tear down the proxy session.
 
-    ``account`` keys: ``email``, ``password``, optional ``proxy_url`` (upstream URL for
-    ``set_proxy.begin_proxy_session``, e.g. ``http://user:pass@host:44443``).
+    ``account`` keys: ``email``, ``password``, optional ``proxy_url`` or ``proxy`` (upstream URL for
+    ``set_proxy.begin_proxy_session``, e.g. ``http://user:pass@host:44443`` — same string shape as DB ``proxy``).
 
     Returns (success, blocked).
     """
+    proxy_url = _upstream_proxy_url_from_account(account)
+    log(
+        account.get("email", "?"),
+        "Starting Post Ads (Markt) flow via markt_ads_post.post_ads..."
+        + (proxy_url or "(no proxy)"),
+        "info",
+    )
     if connect_adb and not ensure_adb_connected():
         return False, True
-
-    proxy_url = (account.get("proxy_url") or "").strip() or None
     effective_udid = udid or getattr(config, "APPIUM_UDID", None)
     driver = None
     try:
@@ -376,6 +592,7 @@ def post_ads(account: dict, connect_adb: bool = True, udid: str | None = None) -
             import set_proxy
 
             set_proxy.begin_proxy_session(proxy_url)
+            time.sleep(5)
         prelaunch = bool(getattr(config, "CHROME_USE_RUNNING_APP", False) and effective_udid)
         if prelaunch:
             launch_chrome_via_adb(effective_udid)

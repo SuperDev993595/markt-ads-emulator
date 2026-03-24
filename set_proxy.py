@@ -6,12 +6,8 @@ import subprocess
 import threading
 from urllib.parse import unquote, urlparse
 
-# ===== YOUR PROXY CONFIG =====
-
-PROXY_HOST = "ultra.marsproxies.com"
-PROXY_PORT = 44443
-USERNAME = "mr841096rRD"
-PASSWORD = "daniel123_country-de_session-ydisdfqc_lifetime-59m"
+# Upstream proxy: set MARKT_PROXY_URL (e.g. http://user:pass@host:44443 or user:pass@host:44443),
+# or pass proxy_url into begin_proxy_session / start_proxy / start_proxy_background / probe_upstream.
 
 # Local listener: bind all interfaces so the Android emulator can reach this process from the host.
 # Chrome on this PC: use http://127.0.0.1:LOCAL_PORT (not "localhost" if you hit IPv6 issues).
@@ -54,23 +50,30 @@ _proxy_session_active = False
 UPSTREAM_CONNECT_TIMEOUT = float(os.environ.get("MARKT_UPSTREAM_CONNECT_TIMEOUT", "25"))
 HEADER_READ_TIMEOUT = float(os.environ.get("MARKT_HEADER_READ_TIMEOUT", "90"))
 
-# Set by _apply_upstream() / start_proxy(); used by handle_client / inject_proxy_auth.
-_UPSTREAM_HOST: str = PROXY_HOST
-_UPSTREAM_PORT: int = PROXY_PORT
+# Set by _apply_upstream() when the forwarder starts; used by handle_client / inject_proxy_auth.
+_UPSTREAM_HOST: str = ""
+_UPSTREAM_PORT: int = 0
 _UPSTREAM_AUTH: str = ""
 
 
 def _resolve_proxy(proxy_url: str | None) -> tuple[str, int, str, str]:
     """
-    Parse a proxy URL like:
-    http://user:password@ultra.marsproxies.com:44443
-    Returns (host, port, username, password). If proxy_url is None/empty, uses module defaults.
+    Parse a proxy URL like http://user:password@host:44443.
+    If proxy_url is None/empty, uses MARKT_PROXY_URL from the environment.
     """
-    if not (proxy_url and proxy_url.strip()):
-        return PROXY_HOST, PROXY_PORT, USERNAME, PASSWORD
-    p = urlparse(proxy_url.strip())
+    raw = (proxy_url or "").strip()
+    if not raw:
+        raw = os.environ.get("MARKT_PROXY_URL", "").strip()
+    if not raw:
+        raise ValueError(
+            "No upstream proxy configured. Set environment variable MARKT_PROXY_URL "
+            "(e.g. http://user:pass@host:44443 or user:pass@host:44443) or pass proxy_url explicitly."
+        )
+    if "://" not in raw:
+        raw = "http://" + raw
+    p = urlparse(raw)
     if not p.hostname:
-        raise ValueError(f"Invalid proxy URL (missing host): {proxy_url!r}")
+        raise ValueError(f"Invalid proxy URL (missing host): {raw!r}")
     port = p.port
     if port is None:
         port = 443 if (p.scheme or "").lower() == "https" else 80
@@ -87,9 +90,6 @@ def _apply_upstream(host: str, port: int, user: str, password: str) -> None:
         _UPSTREAM_AUTH = base64.b64encode(f"{user}:{password}".encode()).decode()
     else:
         _UPSTREAM_AUTH = ""
-
-
-_apply_upstream(PROXY_HOST, PROXY_PORT, USERNAME, PASSWORD)
 
 
 def _tune_socket(s: socket.socket) -> None:
@@ -372,9 +372,8 @@ def probe_upstream(proxy_url: str | None = None) -> None:
 
 def start_proxy(proxy_url: str | None = None) -> None:
     """
-    Start the local forwarding server (blocking). ``proxy_url`` is optional; when set, it is the full upstream
-    URL, e.g. http://user:pass@ultra.marsproxies.com:44443 (same form as proxies.txt lines).
-    When omitted, uses PROXY_HOST / PROXY_PORT / USERNAME / PASSWORD above.
+    Start the local forwarding server (blocking). Upstream is ``proxy_url`` if set, else ``MARKT_PROXY_URL``
+    (e.g. http://user:pass@host:44443 or user:pass@host:44443, same form as proxies.txt lines).
 
     For automation, prefer begin_proxy_session() / end_proxy_session() from ``markt_ads_post.post_ads``.
     """
@@ -470,11 +469,25 @@ def set_adb_proxy() -> None:
 
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(Path(__file__).resolve().parent / ".env")
+    except ImportError:
+        pass
 
     _url = os.environ.get("MARKT_PROXY_URL", "").strip() or (
         sys.argv[1].strip() if len(sys.argv) > 1 else ""
     )
     proxy_url: str | None = _url if _url else None
+    if not proxy_url:
+        print(
+            "Usage: set MARKT_PROXY_URL or: python set_proxy.py http://user:pass@host:port",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     probe_upstream(proxy_url)
     set_adb_proxy()
