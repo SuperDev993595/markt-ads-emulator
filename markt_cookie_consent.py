@@ -11,6 +11,82 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 # OpenCMP: .cmp-button-accept-all in nested shadow DOM (keep in sync with markt_user_init)
+# Full tree walk (document + open/closed shadow roots) for OpenCMP / similar UIs.
+DEEP_CLICK_ACCEPT_SHADOW_JS = """
+        return (function () {
+            function clickEl(el) {
+                if (!el) return false;
+                try {
+                    el.click();
+                } catch (e) {}
+                try {
+                    el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+                } catch (e) {}
+                return true;
+            }
+            function walk(root) {
+                if (!root) return false;
+                try {
+                    if (root.querySelectorAll) {
+                        var hit = root.querySelector(".cmp-button-accept-all, [class*='cmp-button-accept-all']");
+                        if (hit) return clickEl(hit);
+                        var buttons = root.querySelectorAll("button, a[role='button'], [role='button'], a");
+                        for (var i = 0; i < buttons.length; i++) {
+                            var b = buttons[i];
+                            var t = ((b.textContent || "") + "").replace(/\\s+/g, " ").trim().toLowerCase();
+                            if ((t.indexOf("akzeptieren") >= 0 && t.indexOf("weiter") >= 0)
+                                || t.indexOf("alle akzeptieren") >= 0
+                                || t === "akzeptieren") {
+                                return clickEl(b);
+                            }
+                        }
+                    }
+                } catch (e) {}
+                var kids = root.children ? Array.prototype.slice.call(root.children) : [];
+                for (var j = 0; j < kids.length; j++) {
+                    var el = kids[j];
+                    if (el.shadowRoot && walk(el.shadowRoot)) return true;
+                    if (walk(el)) return true;
+                }
+                return false;
+            }
+            var cmp = document.querySelector(".cmp-root-container");
+            if (cmp && walk(cmp)) return true;
+            if (cmp && cmp.shadowRoot && walk(cmp.shadowRoot)) return true;
+            return walk(document.body);
+        })();
+"""
+
+FORCE_HIDE_CMP_OVERLAY_JS = """
+        return (function () {
+            var n = 0;
+            var sels = [
+                ".cmp-root-container",
+                "#usercentrics-root",
+                ".uc-embedding-container",
+                "[id*='usercentrics']",
+                ".fc-consent-root",
+                ".fc-dialog-container"
+            ];
+            for (var i = 0; i < sels.length; i++) {
+                try {
+                    var list = document.querySelectorAll(sels[i]);
+                    for (var j = 0; j < list.length; j++) {
+                        var el = list[j];
+                        el.style.setProperty("display", "none", "important");
+                        el.style.setProperty("visibility", "hidden", "important");
+                        el.style.setProperty("pointer-events", "none", "important");
+                        n++;
+                    }
+                } catch (e) {}
+            }
+            try {
+                document.body.style.overflow = "auto";
+            } catch (e) {}
+            return n;
+        })();
+"""
+
 FIND_ACCEPT_BTN_JS = """
         function findAcceptInRoot(root) {
             if (!root) return null;
@@ -41,6 +117,76 @@ def _default_log(email: str, message: str, level: str = "info") -> None:
     print(f"[{level.upper()}] {email}: {message}", flush=True)
 
 
+def _try_selenium_shadow_accept(
+    driver: Any,
+    email: str,
+    log_fn: Callable[[str, str, str], None],
+) -> bool:
+    """Selenium 4: pierce .cmp-root-container closed shadow root and click accept."""
+    from selenium.webdriver.common.by import By
+
+    try:
+        host = driver.find_element(By.CSS_SELECTOR, ".cmp-root-container")
+    except Exception:
+        return False
+    try:
+        sr = host.shadow_root
+    except Exception:
+        return False
+    selectors = (
+        ".cmp-button-accept-all",
+        '[class*="cmp-button-accept-all"]',
+        'button[class*="accept"]',
+        "button.cmp-button",
+    )
+    for sel in selectors:
+        try:
+            for el in sr.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if el.is_displayed():
+                        el.click()
+                        log_fn(email, f"Clicked cookie accept (shadow_root selector {sel!r}).", "debug")
+                        time.sleep(1)
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def _cmp_overlay_visible(driver: Any) -> bool:
+    from selenium.webdriver.common.by import By
+
+    try:
+        for el in driver.find_elements(By.CSS_SELECTOR, ".cmp-root-container"):
+            try:
+                if el.is_displayed():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def force_hide_cmp_overlay(driver: Any, email: str, log_fn: Callable[[str, str, str], None]) -> bool:
+    """Last resort: hide CMP host nodes so the login form is clickable (prefer real accept when possible)."""
+    try:
+        n = driver.execute_script(FORCE_HIDE_CMP_OVERLAY_JS.strip())
+        if n and int(n) > 0:
+            log_fn(
+                email,
+                f"CMP/cookie layer hidden via CSS fallback ({n} node(s)) so automation can continue.",
+                "warning",
+            )
+            time.sleep(0.5)
+            return True
+    except Exception as e:
+        log_fn(email, f"CMP hide fallback failed: {e}", "debug")
+    return False
+
+
 def click_accept_all_cookies_selenium(
     driver: Any,
     email: str,
@@ -56,8 +202,20 @@ def click_accept_all_cookies_selenium(
 
     log = log_fn or _default_log
 
-    time.sleep(5)
-    for _ in range(8):
+    time.sleep(3)
+    for _ in range(10):
+        try:
+            if _try_selenium_shadow_accept(driver, email, log):
+                return True
+        except Exception:
+            pass
+        try:
+            if driver.execute_script(DEEP_CLICK_ACCEPT_SHADOW_JS.strip()) is True:
+                log(email, "Clicked cookie accept (deep shadow walk).", "debug")
+                time.sleep(1)
+                return True
+        except Exception:
+            pass
         try:
             for el in driver.find_elements(By.CSS_SELECTOR, ".cmp-button-accept-all"):
                 if el.is_displayed():
@@ -282,6 +440,9 @@ def click_accept_all_cookies_selenium(
         except Exception:
             continue
 
+    if _cmp_overlay_visible(driver) and force_hide_cmp_overlay(driver, email, log):
+        return True
+
     try:
         diag = driver.execute_script(
             """return (function() {
@@ -305,5 +466,14 @@ def click_accept_all_cookies_selenium(
         log(email, f"Cookie accept diagnostic: {diag}", "debug")
     except Exception as e:
         log(email, f"Cookie accept diagnostic failed: {e}", "debug")
+    if _cmp_overlay_visible(driver) and force_hide_cmp_overlay(driver, email, log):
+        return True
     log(email, "Cookie accept not found after retries (may already be accepted).", "debug")
     return False
+
+
+def dismiss_cmp_if_blocking(driver: Any, email: str, log_fn: Optional[Callable[[str, str, str], None]] = None) -> None:
+    """If the CMP host is still visible (e.g. accept click missed), hide it so form interactions work."""
+    log = log_fn or _default_log
+    if _cmp_overlay_visible(driver):
+        force_hide_cmp_overlay(driver, email, log)

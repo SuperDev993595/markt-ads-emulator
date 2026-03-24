@@ -1,6 +1,6 @@
 @echo off
 REM Appium only sees ANDROID_HOME in THIS process. Start Appium with this file
-REM (keep the window open), then run: python markt_emulator_login.py
+REM (keep the window open), then run: python markt_ads_post.py
 REM Edit the path below if your SDK is elsewhere (must match Android Studio SDK path).
 
 set "ANDROID_HOME=C:\Users\root\AppData\Local\Android\Sdk"

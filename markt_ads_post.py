@@ -1,5 +1,5 @@
 """
-markt.de auto-login via Android emulator (LDPlayer or BlueStacks).
+markt.de ads posting flow via Android emulator (LDPlayer or BlueStacks) — login and post setup.
 Uses Appium to control Chrome inside the emulator — same flow as browser/Playwright,
 but runs in the emulator's Chrome.
 
@@ -24,10 +24,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 
 import config
-from markt_cookie_consent import click_accept_all_cookies_selenium
+from markt_cookie_consent import click_accept_all_cookies_selenium, dismiss_cmp_if_blocking
 
 MARKT_MEINE_ANZEIGEN_URL = "https://www.markt.de/benutzer/meineanzeigen.htm"
 MARKT_INSERIEREN_URL = "https://www.markt.de/benutzer/inserieren.htm"
+
+# Account dict keys: "email", "password", optional "proxy_url" (full upstream URL for
+# set_proxy.begin_proxy_session — device uses ADB global http_proxy, not Chrome flags).
 
 # Shown on Meine Anzeigen when the profile cannot publish (all parts should appear in page HTML).
 MEINE_ANZEIGEN_CANNOT_POST_SNIPPETS: tuple[str, ...] = (
@@ -110,7 +113,9 @@ def create_driver(udid: Optional[str] = None, use_running_chrome: Optional[bool]
     effective_udid = udid or getattr(config, "APPIUM_UDID", None) or None
     pkg = getattr(config, "CHROME_ANDROID_PACKAGE", "com.android.chrome")
     use_running = use_running_chrome if use_running_chrome is not None else getattr(config, "CHROME_USE_RUNNING_APP", False)
+
     extra_args = list(getattr(config, "CHROME_EXTRA_ARGS", None) or [])
+
     chrome_opts: dict = {"androidPackage": pkg}
     if use_running:
         chrome_opts["androidUseRunningApp"] = True
@@ -246,7 +251,8 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
         return False, True
 
     time.sleep(2)
-    #click_accept_all_cookies_selenium(driver, email, log)
+    # click_accept_all_cookies_selenium(driver, email, log)
+    dismiss_cmp_if_blocking(driver, email, log)
     time.sleep(2)
 
     try:
@@ -254,7 +260,10 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
         pw_el = driver.find_element(By.CSS_SELECTOR, "#clsy-login-password")
         remember_me = driver.find_element(By.CSS_SELECTOR, "#clsy-login-rememberme")
         if remember_me:
-            remember_me.click()
+            try:
+                remember_me.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", remember_me)
             time.sleep(1)
         if email_el:
             email_el.clear()
@@ -325,18 +334,29 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
     return True, False
 
 
-def run_login(account: dict, connect_adb: bool = True, udid: str | None = None) -> tuple[bool, bool]:
+def post_ads(account: dict, connect_adb: bool = True, udid: str | None = None) -> tuple[bool, bool]:
     """
-    Full flow: ensure ADB connected, create driver, login, quit.
+    Full flow: optional ``set_proxy`` session from ``account[\"proxy_url\"]``, ensure ADB connected,
+    create driver, login, quit, then tear down the proxy session.
+
+    ``account`` keys: ``email``, ``password``, optional ``proxy_url`` (upstream URL for
+    ``set_proxy.begin_proxy_session``, e.g. ``http://user:pass@host:44443``).
+
     Returns (success, blocked).
     """
     if connect_adb and not ensure_adb_connected():
         return False, True
 
+    proxy_url = (account.get("proxy_url") or "").strip() or None
     driver = None
     try:
+        if proxy_url:
+            import set_proxy
+
+            set_proxy.begin_proxy_session(proxy_url)
         effective_udid = udid or getattr(config, "APPIUM_UDID", None)
-        if getattr(config, "CHROME_USE_RUNNING_APP", False) and effective_udid:
+        prelaunch = bool(getattr(config, "CHROME_USE_RUNNING_APP", False) and effective_udid)
+        if prelaunch:
             launch_chrome_via_adb(effective_udid)
             time.sleep(3)
         driver = create_driver(udid=udid)
@@ -347,13 +367,15 @@ def run_login(account: dict, connect_adb: bool = True, udid: str | None = None) 
         traceback.print_exc()
         return False, True
     finally:
-        if driver and not getattr(config, "KEEP_BROWSER_OPEN", False):
+        if driver:
             try:
                 driver.quit()
             except Exception:
                 pass
-        elif driver and getattr(config, "KEEP_BROWSER_OPEN", False):
-            log(account.get("email", "?"), "KEEP_BROWSER_OPEN=True: Chrome left open. Close it manually or run script again.", "info")
+        if proxy_url:
+            import set_proxy
+
+            set_proxy.end_proxy_session()
 
 
 if __name__ == "__main__":
@@ -366,12 +388,21 @@ if __name__ == "__main__":
         pass
     _email = _os.environ.get("MARKT_EMAIL", "").strip()  # noqa: PLC0415
     _password = _os.environ.get("MARKT_PASSWORD", "").strip()
+    _proxy = _os.environ.get("MARKT_PROXY_URL", "").strip()
     if not _email or not _password:
-        print("Usage: set MARKT_EMAIL and MARKT_PASSWORD, or pass email password as args.", file=sys.stderr)
+        print(
+            "Usage: set MARKT_EMAIL and MARKT_PASSWORD (optional MARKT_PROXY_URL), "
+            "or: python markt_ads_post.py email password [proxy_url]",
+            file=sys.stderr,
+        )
         if len(sys.argv) >= 3:
             _email, _password = sys.argv[1], sys.argv[2]
+            if len(sys.argv) >= 4:
+                _proxy = sys.argv[3].strip()
         else:
             sys.exit(1)
     account = {"email": _email, "password": _password}
-    success, blocked = run_login(account)
+    if _proxy:
+        account["proxy_url"] = _proxy
+    success, blocked = post_ads(account)
     sys.exit(0 if success else (2 if blocked else 1))

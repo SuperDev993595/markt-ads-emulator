@@ -17,16 +17,16 @@ CHROMEDRIVER_EXECUTABLE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "chromedriver-cache"
 )
 
-# ADB connection to emulator (used to ensure device is connected before Appium)
-# LDPlayer: usually 5554 (first instance), 5556, 5564, etc.
+# ADB connection to emulator (used by connect_emulator.py and "adb connect" hints)
+# Android Studio AVD: often appears as emulator-5554 / TCP 5554 on localhost.
+# LDPlayer: usually 127.0.0.1:5554 (first instance), 5556, 5564, etc.
 # BlueStacks 5: usually 5555 (first instance), 5557, 5559, etc.
 EMULATOR_ADB_HOST = "127.0.0.1"
-EMULATOR_ADB_PORT = 5555
+EMULATOR_ADB_PORT = 5554
 
 # If `adb devices` lists more than one device, Chromedriver must target the one running Chrome.
-# Set to that device's serial (e.g. "127.0.0.1:5555" for LDPlayer, "emulator-5554" for another AVD).
-# If unsure: adb devices — use the serial where you manually open Chrome.
-APPIUM_UDID = "127.0.0.1:5555"
+# Must match `adb devices` serial (e.g. "emulator-5554" for AVD, "127.0.0.1:5554" for LDPlayer TCP).
+APPIUM_UDID = "emulator-5554"
 
 # Chrome package inside the emulator (must match installed browser).
 # Check: adb -s <serial> shell pm list packages | findstr chrome

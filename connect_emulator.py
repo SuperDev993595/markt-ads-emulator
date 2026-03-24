@@ -1,9 +1,9 @@
 """
 Connect ADB to your emulator. Run this once before starting Appium/login if needed.
 
-  python connect_emulator.py          # use config.EMULATOR_ADB_PORT
-  python connect_emulator.py 5554     # LDPlayer
-  python connect_emulator.py 5555     # BlueStacks
+  python connect_emulator.py          # use config.EMULATOR_ADB_PORT (default 5554)
+  python connect_emulator.py 5554     # explicit (AVD / LDPlayer first instance)
+  python connect_emulator.py 5555     # BlueStacks (typical)
 """
 
 import subprocess
@@ -27,7 +27,7 @@ def main():
         sys.exit(r.returncode)
     r = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=5)
     print(r.stdout)
-    print("Done. Start your emulator's Chrome (or let Appium start it), then run markt_emulator_login.")
+    print("Done. Start your emulator's Chrome (or let Appium start it), then run: python markt_ads_post.py")
 
 if __name__ == "__main__":
     main()
