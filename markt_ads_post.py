@@ -106,6 +106,27 @@ def launch_chrome_via_adb(udid: str) -> bool:
         return False
 
 
+def close_chrome_via_adb(udid: str) -> bool:
+    """Force-close Chrome app on device via ADB."""
+    adb = config.ADB_PATH or "adb"
+    pkg = getattr(config, "CHROME_ANDROID_PACKAGE", "com.android.chrome")
+    try:
+        r = subprocess.run(
+            [adb, "-s", udid, "shell", "am", "force-stop", pkg],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            log("system", f"ADB force-stop Chrome failed: {r.stderr or r.stdout}", "warning")
+            return False
+        log("system", "Closed Chrome via ADB force-stop.", "debug")
+        return True
+    except Exception as e:
+        log("system", f"ADB force-stop Chrome error: {e}", "warning")
+        return False
+
+
 def create_driver(udid: Optional[str] = None, use_running_chrome: Optional[bool] = None):
     """Create Appium WebDriver for Chrome on Android emulator."""
     cache = Path(config.CHROMEDRIVER_EXECUTABLE_DIR).resolve()
@@ -348,13 +369,13 @@ def post_ads(account: dict, connect_adb: bool = True, udid: str | None = None) -
         return False, True
 
     proxy_url = (account.get("proxy_url") or "").strip() or None
+    effective_udid = udid or getattr(config, "APPIUM_UDID", None)
     driver = None
     try:
         if proxy_url:
             import set_proxy
 
             set_proxy.begin_proxy_session(proxy_url)
-        effective_udid = udid or getattr(config, "APPIUM_UDID", None)
         prelaunch = bool(getattr(config, "CHROME_USE_RUNNING_APP", False) and effective_udid)
         if prelaunch:
             launch_chrome_via_adb(effective_udid)
@@ -372,6 +393,8 @@ def post_ads(account: dict, connect_adb: bool = True, udid: str | None = None) -
                 driver.quit()
             except Exception:
                 pass
+        if effective_udid:
+            close_chrome_via_adb(effective_udid)
         if proxy_url:
             import set_proxy
 
