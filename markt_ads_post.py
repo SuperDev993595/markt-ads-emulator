@@ -447,7 +447,7 @@ def navigate_to_inserieren(driver, email: str) -> bool:
             "info",
         )
 
-        time.sleep(120)
+        time.sleep(5)
         return True
     except Exception as e:
         log(email, f"Inserieren failed: {e}", "error")
@@ -466,10 +466,18 @@ def markt_login_and_save(driver, account: dict) -> tuple[bool, bool]:
     email = account.get("email", "")
     password = account.get("password") or ""
     login_url = "https://www.markt.de/nichtangemeldet.htm"
+    profile_edit_url = "https://www.markt.de/benutzer/profilbearbeiten.htm"
+    logout_url = "https://www.markt.de/benutzer/logout.htm"
 
     log(email, f"email: {email} password: {'*' * len(password)}", "info")
 
     try:
+        driver.get(profile_edit_url)
+        ensure_chrome_webview_context(driver)
+        time.sleep(2)
+        driver.get(logout_url)
+        ensure_chrome_webview_context(driver)
+        time.sleep(2)
         driver.get(login_url)
         ensure_chrome_webview_context(driver)
     except Exception as e:
